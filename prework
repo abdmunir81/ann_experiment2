@@ -1,0 +1,159 @@
+def handle_data(context, data):
+    """
+        A function to define things to do at every bar
+    """
+       
+
+    if check_stop_loss(context,data):
+        print('{} check stop loss'.format(get_datetime()))
+        return
+
+    if check_take_prft(context,data):
+        print('{} got profit take'.format(get_datetime()))
+        return
+
+    if context.trading_hours == False:
+        return
+
+    context.bar_count = context.bar_count + 1
+    if context.bar_count < context.params['trade_freq']:
+        return
+
+   
+
+
+    # time to trade, call the strategy function
+    context.bar_count = 30
+    run_strategy(context, data)
+
+
+
+def run_strategy(context, data):
+    """
+        A function to define core strategy steps
+    """
+    generate_signals(context, data)
+    generate_target_position(context, data)
+    rebalance(context, data)
+    calculate_entry_price(context,data)
+    
+
+
+def rebalance(context,data):
+    """
+        A function to rebalance - all execution logic goes here
+    """
+    for security in context.securities:
+        order_target(security, context.target_position[security])
+
+def generate_target_position(context, data):
+    """
+        A function to define target portfolio
+    """
+    num_secs = len(context.securities)
+    weight = round(7.0/num_secs,2)*context.params['leverage']*context.lot_size
+
+    for security in context.securities:
+        if context.signals[security]  > context.params['buy_signal_threshold']  :
+            context.target_position[security] = weight
+        elif context.signals[security]  < context.params['sell_signal_threshold']  :
+            context.target_position[security] = -weight
+        else:
+            context.target_position[security] = 0
+
+
+def generate_signals(context, data):
+    """
+        A function to define define the signal generation
+    """
+    
+    try:
+        price_data  = data.history(context.securities, 'close',
+            context.params['indicator_lookback'], context.params['indicator_freq'])
+    except:
+        return
+
+    for security in context.securities:
+         px  = price_data.loc[:,security].values
+         context.signals[security] = signal_function(px, context.params)
+
+def signal_function(context,data):
+
+    ps  = data.history(context.securities, 'close',
+            200, context.params['indicator_freq'])
+    pc= ps.to_frame()
+    pc["returns"] = np.log(pc.div(pc.shift(10)))
+
+# Adding Features
+
+    pc["dir"] = np.where(pc["returns"] > pc, 1, 0)
+    pc["sma"] = pc.rolling(50).mean() - pc.rolling(150).mean()
+    pc["smamax"] = np.where(pc.rolling(9).mean() > pc.rolling(21).mean() , 1, 0)
+    pc["smamin"] = np.where(pc.rolling(9).mean() < pc.rolling(21).mean() , 1,0)
+    pc["boll"] = (pc - pc.rolling(50).mean()) / pc.rolling(window).std()
+    pc["min"] = pc.rolling(50).min / pc-1
+    pc["max"] = pc.rolling(50).max / pc -1
+    pc["mom"] = pc["returns"].rolling(3).mean()
+    pc["vol"] = pc["returns"].rolling(50).std()
+    pc['rsi'] = talib.RSI(pc['Close'].values, timeperiod = 20)
+    pc['rsi_up'] = np.where(talib.RSI(pc['Close'].values, timeperiod = 20) < 30 ,1,0)
+    pc['rsi_down'] = np.where(talib.RSI(pc['Close'].values, timeperiod = 20) > 70 ,1,0)
+    pc.dropna(inplace = True)
+
+# Adding Feature Lag
+    lags = 7
+    cols = []
+    features = ["dir","sma","smamax","smamin", "boll", "min", "max", "mom" , "vol", 
+                "rsi",'rsi_up','rsi_down']
+    for f in features:
+        for lag in range(1, lags + 1):
+            col = "{}_lag_{}".format(f, lag)
+            pc[col] = pc[f].shift(lag)
+            cols.append(col)
+    pc.dropna(inplace = True)
+
+# Split
+    from sklearn.model_selection import train_test_split
+    X = pc.drop("dir", axis = 1)
+    y = pc.loc[:,"dir"]
+    X_train, X_test, y_train, y_test = train_test_split(X,y,test_size=0.2,random_state=27)
+    
+#Scaling   
+    from sklearn.preprocessing import MinMaxScaler
+    sc = MinMaxScaler()
+    X_train = sc.fit_transform(X_train)
+    X_test = sc.transform(X_test)
+
+#Predict
+
+    classifier = Sequential()
+    classifier.add(Dense(units = 128, kernel_initializer = 'uniform', activation = 'relu'))
+    classifier.add(Dense(units = 128, kernel_initializer = 'uniform', activation= 'relu'))
+    classifier.add(Dense(units = 1, kernel_initializer = 'uniform', activation = 'sigmoid'))
+    classifier.compile(optimizer = 'adam', loss = 'binary_crossentropy', metrics= ['accuracy'])
+    classifier.fit(X_train, y_train, batch_size = 32, epochs = 100)
+    
+    ypred =  (classifier.predict(X_test))
+
+    hit = y.ypred.iloc[:,-1]
+             
+
+
+    """
+        The main trading logic goes here, called by generate_signals above
+    """
+    
+
+    ind1 = rsi(context, data['RSI_period'])
+    ind2 = ema(context,data['SMA_period_short'])
+    ind3 = ema(context,data['SMA_period_long'])
+    ind4 = ema(context, data['SMA_period_trend'])
+    
+
+   
+    if hit>0.53 and ind2>ind3 and ind1>60 and (ind1-ind4)/ind4 >0 :
+        return -1
+    elif hit<0.47 and ind2<ind3 and ind1<40 and (ind1-ind4)/ind4 <0 :
+        return 1 
+    else:
+        return 0
